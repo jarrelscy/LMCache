@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import json
 import os
 import threading
 import time
@@ -15,7 +16,13 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    STR_DTYPE_TO_TORCH_DTYPE,
+    TORCH_DTYPE_TO_STR_DTYPE,
+    CacheEngineKey,
+    DiskCacheMetadata,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -36,6 +43,45 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DEFAULT_THREAD_COUNT = 4
+
+# On-disk sidecar metadata format for LocalDiskBackend entries.
+#
+# LocalDiskBackend historically wrote only the raw KV bytes to
+# `<key>.pt`, keeping shape/dtype/fmt/size solely in the in-memory
+# `self.dict` index. That index was never rebuilt from disk on startup,
+# so every process restart silently dropped 100% of the persisted cache
+# (a `contains()` miss on every key, indistinguishable from an empty
+# cache) even though the bytes were still sitting on disk. This sidecar
+# (`<key>.pt.meta`) plus the rebuild/lazy-load logic below fixes that.
+_LOCAL_DISK_METADATA_FILE_SUFFIX = ".meta"
+_LOCAL_DISK_METADATA_VERSION = 1
+
+
+def _pack_local_disk_metadata(memory_obj: MemoryObj) -> bytes:
+    """Serialize the (shape, dtype, fmt, size) needed to reconstruct a
+    ``DiskCacheMetadata`` entry, so a later process can rebuild its index
+    from the files already on disk."""
+    tensor = memory_obj.tensor
+    assert tensor is not None
+    meta = {
+        "lmcache_version": _LOCAL_DISK_METADATA_VERSION,
+        "shape": list(tensor.size()),
+        "dtype": TORCH_DTYPE_TO_STR_DTYPE[tensor.dtype],
+        "fmt": memory_obj.metadata.fmt.value,
+        "size": memory_obj.get_physical_size(),
+    }
+    return json.dumps(meta).encode("utf-8")
+
+
+def _unpack_local_disk_metadata(buf: bytes):
+    meta = json.loads(buf.decode("utf-8"))
+    if meta.get("lmcache_version") != _LOCAL_DISK_METADATA_VERSION:
+        raise ValueError(f"Unsupported local-disk metadata payload: {meta}")
+    shape = torch.Size(meta["shape"])
+    dtype = STR_DTYPE_TO_TORCH_DTYPE[meta["dtype"]]
+    fmt = MemoryFormat(meta["fmt"])
+    size = int(meta["size"])
+    return shape, dtype, fmt, size
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -198,6 +244,18 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             logger.warning("Controller message sender is not initialized")
 
+        # Rebuild the index from whatever is already on disk (e.g. from a
+        # previous process instance / container restart). Without this,
+        # `self.dict` starts empty every boot and every `contains()` call
+        # reports a miss regardless of what is actually persisted on disk,
+        # so cross-restart persistence is 0% even though the bytes are
+        # there. See `_rebuild_index` / `_try_lazy_load_metadata` below.
+        self.metadata = metadata
+        self._index_rebuilt = threading.Event()
+        self._rebuild_index_future = asyncio.run_coroutine_threadsafe(
+            self._rebuild_index(), self.loop
+        )
+
     def __str__(self) -> str:
         return "LocalDiskBackend"
 
@@ -207,10 +265,149 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> str:
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
 
-    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+    async def _rebuild_index(self) -> None:
+        try:
+            await asyncio.to_thread(self._rebuild_index_sync)
+        except Exception:
+            logger.exception(
+                "LocalDiskBackend: startup index rebuild from %s failed; "
+                "cache will behave as if empty (writes still work).",
+                self.path,
+            )
+        finally:
+            self._index_rebuilt.set()
+
+    def _rebuild_index_sync(self) -> None:
+        """Scan `self.path` for `<key>.pt` + `<key>.pt.meta` pairs left by a
+        previous process instance and repopulate `self.dict` so that
+        persisted entries survive a restart.
+
+        Best-effort: any file that can't be parsed/decoded is skipped (and
+        logged) rather than aborting the whole scan, and orphaned sidecar
+        files (metadata written but the process crashed before/instead of
+        finishing the data write, or vice versa) are cleaned up.
+        """
+        if self.metadata is None:
+            logger.warning(
+                "LocalDiskBackend: no LMCacheMetadata available, skipping "
+                "startup index rebuild from %s (cross-restart persistence "
+                "will not work this boot).",
+                self.path,
+            )
+            return
+
+        model_prefix = self.metadata.model_name.replace("/", "-")
+        suffix = _LOCAL_DISK_METADATA_FILE_SUFFIX
+        n_loaded = 0
+        n_skipped = 0
+
+        start = time.perf_counter()
+        try:
+            scan_iter = os.scandir(self.path)
+        except OSError as e:
+            logger.warning(
+                "LocalDiskBackend: cannot scan %s for existing cache "
+                "entries: %s",
+                self.path,
+                e,
+            )
+            return
+
+        # Sidecar filenames are `<mangled_key_str>.pt.meta` (`_key_to_path`
+        # appends ".pt" to the mangled key string, and the sidecar adds
+        # `suffix` on top of that) -- strip both to recover the key string.
+        data_suffix = ".pt" + suffix
+
+        with scan_iter:
+            for entry in scan_iter:
+                if not entry.name.endswith(data_suffix) or not entry.is_file():
+                    continue
+                key_str = entry.name[: -len(data_suffix)]
+                if not key_str.startswith(model_prefix + "@"):
+                    # Either a stray file or an entry from a different
+                    # model_name sharing this cache directory; not ours.
+                    n_skipped += 1
+                    continue
+                unmangled_key_str = self.metadata.model_name + key_str[len(model_prefix):]
+                data_path = entry.path[: -len(suffix)]
+                if not os.path.exists(data_path):
+                    # Orphan metadata (crash between the two writes below).
+                    try:
+                        os.remove(entry.path)
+                    except OSError:
+                        pass
+                    n_skipped += 1
+                    continue
+                try:
+                    key = CacheEngineKey.from_string(unmangled_key_str)
+                    with open(entry.path, "rb") as f:
+                        shape, dtype, fmt, size = _unpack_local_disk_metadata(
+                            f.read()
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "LocalDiskBackend: skipping unreadable cache entry "
+                        "%s: %s",
+                        entry.path,
+                        e,
+                    )
+                    n_skipped += 1
+                    continue
+                with self.disk_lock:
+                    if key not in self.dict:
+                        self.dict[key] = DiskCacheMetadata(
+                            data_path, size, shape, dtype, None, fmt, 0
+                        )
+                        self.current_cache_size += size
+                        self.usage += size
+                        n_loaded += 1
+
+        self.stats_monitor.update_local_storage_usage(self.usage)
+        logger.info(
+            "LocalDiskBackend: rebuilt index from %s in %.2fs: "
+            "%d entries recovered, %d skipped.",
+            self.path,
+            time.perf_counter() - start,
+            n_loaded,
+            n_skipped,
+        )
+
+    def _try_lazy_load_metadata(self, key: CacheEngineKey) -> bool:
+        """Per-key fallback used on a `contains()`/`pin()` miss: the bulk
+        `_rebuild_index` scan may not have reached this key yet (still
+        running) or may have started after this key's files were written
+        by a concurrent process. Mirrors GDS backend's lazy per-key probe.
+        """
+        path = self._key_to_path(key)
+        meta_path = path + _LOCAL_DISK_METADATA_FILE_SUFFIX
+        if not os.path.exists(meta_path) or not os.path.exists(path):
+            return False
+        try:
+            with open(meta_path, "rb") as f:
+                shape, dtype, fmt, size = _unpack_local_disk_metadata(f.read())
+        except Exception as e:
+            logger.warning(
+                "LocalDiskBackend: lazy metadata read failed for %s at %s: %s",
+                key,
+                meta_path,
+                e,
+            )
+            return False
         with self.disk_lock:
             if key not in self.dict:
-                return False
+                self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, None, fmt, 0)
+                self.current_cache_size += size
+                self.usage += size
+        return True
+
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        with self.disk_lock:
+            found = key in self.dict
+        if not found:
+            found = self._try_lazy_load_metadata(key)
+        if not found:
+            return False
+        with self.disk_lock:
             if pin:
                 self.dict[key].pin()
                 # vllm lookup sets pin to True
@@ -272,6 +469,10 @@ class LocalDiskBackend(StorageBackendInterface):
             # res.result()
 
             os.remove(path)
+            try:
+                os.remove(path + _LOCAL_DISK_METADATA_FILE_SUFFIX)
+            except OSError:
+                pass
 
             if force:
                 self.cache_policy.update_on_force_evict(key)
@@ -640,6 +841,20 @@ class LocalDiskBackend(StorageBackendInterface):
         # TODO(Jiayi): need to add ref count in disk memory object
         self.write_file(buffer, path)
 
+        # Persist a small sidecar with shape/dtype/fmt/size so a future
+        # process instance can rebuild `self.dict` from disk (see
+        # `_rebuild_index_sync`); without this, only the raw bytes survive
+        # a restart and the in-memory index (the only place this metadata
+        # otherwise lived) is gone, making every entry unreachable.
+        try:
+            meta_bytes = _pack_local_disk_metadata(memory_obj)
+            self.write_file(meta_bytes, path + _LOCAL_DISK_METADATA_FILE_SUFFIX)
+        except Exception as e:
+            logger.warning(
+                f"LocalDiskBackend: failed writing metadata sidecar for "
+                f"{key} at {path}{_LOCAL_DISK_METADATA_FILE_SUFFIX}: {e}"
+            )
+
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
         # Ref count down better be before `insert_key` for testing
@@ -768,6 +983,12 @@ class LocalDiskBackend(StorageBackendInterface):
         return self.local_cpu_backend
 
     def close(self) -> None:
+        # Wait for the startup index rebuild so we don't tear down the
+        # event loop it's running on while it's still scanning.
+        try:
+            self._rebuild_index_future.result(timeout=30)
+        except Exception as e:
+            logger.warning(f"Exception while waiting for index rebuild: {e}")
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self._read_thread_pool.shutdown(wait=True)
