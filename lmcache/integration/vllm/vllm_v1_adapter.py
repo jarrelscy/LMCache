@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
     get_pp_group,
 )
 from vllm.sampling_params import SamplingParams
@@ -44,6 +45,7 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
+from lmcache.v1.dcp_utils import assert_dcp_chunking_compatible, plan_dcp_chunk
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -280,8 +282,16 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
-    # Slot mapping
-    slot_mapping: torch.Tensor
+    # Slot mapping, in vLLM's own (global, replicated) physical-slot
+    # index space. Populated only when decode_context_parallel_size<=1:
+    # a rank-agnostic, ready-to-use slot_mapping, exactly as before DCP
+    # support was added. Under DCP each rank physically owns a different
+    # subset of slots for the very same tokens, so a single
+    # scheduler-computed slot_mapping cannot be correct for every worker
+    # rank at once -- `block_ids` is populated instead in that case, and
+    # each worker computes its own local slot_mapping from it (see
+    # LMCacheConnectorV1Impl._dcp_retrieve_request/_dcp_store_request).
+    slot_mapping: Optional[torch.Tensor] = None
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -294,6 +304,11 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Virtual block ids allocated for this request's `token_ids` (one id
+    # per `block_size * decode_context_parallel_size` GLOBAL tokens).
+    # Populated only when decode_context_parallel_size>1; see
+    # `slot_mapping` above.
+    block_ids: Optional[list[int]] = None
 
     @staticmethod
     def from_request_tracker(
@@ -303,6 +318,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        dcp_world: int = 1,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -313,6 +329,13 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            dcp_world (int): `decode_context_parallel_size`. This method
+                runs on the scheduler, which has no notion of a per-worker
+                DCP rank -- when dcp_world>1 it deliberately does NOT
+                compute a slot_mapping (that would need to be correct for
+                every rank at once, which is impossible), and instead
+                exposes the allocated (virtual) block ids so each worker
+                can derive its own local slot_mapping.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -383,8 +406,13 @@ class ReqMeta:
             token_ids = token_ids.tolist()
 
         num_blocks = len(tracker.allocated_block_ids)
+        # Under DCP, each allocated (virtual) block id covers
+        # block_size*dcp_world GLOBAL tokens, not block_size -- the
+        # scheduler-side capacity sanity check below must use the same
+        # stride the scheduler itself allocated with.
+        virtual_block_size = block_size * dcp_world
 
-        if len(token_ids) > num_blocks * block_size:
+        if len(token_ids) > num_blocks * virtual_block_size:
             logger.error(
                 "The number of tokens is more than the number of blocks"
                 " for request %s. "
@@ -392,21 +420,31 @@ class ReqMeta:
                 tracker.req_id,
             )
             logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
+                "Num tokens: %d, num blocks: %d, block size: %d, dcp_world: %d",
                 len(token_ids),
                 num_blocks,
                 block_size,
+                dcp_world,
             )
 
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
-        )
+        if dcp_world <= 1:
+            block_ids_t = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
+            block_offsets = torch.arange(0, block_size, dtype=torch.long)
+            slot_mapping = (
+                block_offsets.reshape((1, block_size))
+                + block_ids_t.reshape((num_blocks, 1)) * block_size
+            )
 
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
-        assert slot_mapping.dtype == torch.long  # TODO: this could be removed
+            slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+            assert slot_mapping.dtype == torch.long  # TODO: this could be removed
+            req_block_ids = None
+        else:
+            # Rank-agnostic here (this runs once, on the scheduler): each
+            # worker derives its own local slot_mapping from these
+            # (virtual) block ids -- see _dcp_retrieve_request /
+            # _dcp_store_request.
+            slot_mapping = None
+            req_block_ids = list(tracker.allocated_block_ids)
 
         # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -433,6 +471,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            block_ids=req_block_ids,
         )
 
 
@@ -515,6 +554,24 @@ class LMCacheConnectorV1Impl:
                             config_key,
                         )
 
+        # Under Decode Context Parallelism the KV cache is token-sharded
+        # per rank: `save_only_first_rank` (which skips storing on every
+        # rank but the first, relying on it holding the full, replicated
+        # KV) would silently drop every other rank's shard. Force it off
+        # regardless of user/model-default config -- each DCP rank must
+        # independently store/retrieve its own local shard.
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            if config.extra_config is None:
+                config.extra_config = {}
+            if config.extra_config.get("save_only_first_rank"):
+                logger.warning(
+                    "decode_context_parallel_size>1: forcing "
+                    "save_only_first_rank=False (was explicitly set True in "
+                    "config); each DCP rank must store/retrieve its own "
+                    "local KV shard."
+                )
+            config.extra_config["save_only_first_rank"] = False
+
     def _init_connector_state(
         self,
         role: KVConnectorRole,
@@ -567,6 +624,28 @@ class LMCacheConnectorV1Impl:
         )
 
         self._lmcache_chunk_size = config.chunk_size
+
+        # Decode Context Parallelism: vLLM reuses the TP group's GPUs and
+        # token-shards the KV cache across dcp_world ranks. dcp_world<=1
+        # (the default) means DCP is disabled and every code path below
+        # that branches on it is a no-op, preserving prior behavior
+        # exactly.
+        self.dcp_world: int = vllm_config.parallel_config.decode_context_parallel_size
+        self._cp_kv_cache_interleave: int = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        self.dcp_rank: int = 0
+        if self.dcp_world > 1:
+            assert_dcp_chunking_compatible(
+                self._lmcache_chunk_size, self._block_size, self.dcp_world
+            )
+            if role == KVConnectorRole.WORKER:
+                # get_dcp_group() asserts the distributed DCP group is
+                # initialized -- only true worker-side, post-init. The
+                # scheduler process never needs a rank: it deliberately
+                # never computes a per-rank slot_mapping (see
+                # ReqMeta.from_request_tracker).
+                self.dcp_rank = get_dcp_group().rank_in_group()
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -813,6 +892,10 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
+            if self.dcp_world > 1:
+                self._dcp_retrieve_request(request, kvcaches)
+                continue
+
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.to(self.device)
@@ -893,6 +976,255 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+    def _dcp_retrieve_request(
+        self, request: "ReqMeta", kvcaches: list[torch.Tensor]
+    ) -> None:
+        """DCP-aware equivalent of the tokens/mask retrieve() call above,
+        for one request, when decode_context_parallel_size>1.
+
+        The chunk hash stays in GLOBAL token space (matching what was
+        stored -- possibly by a run with a different dcp_world/rank
+        layout, or no DCP at all), while offsets/slot_mapping are
+        computed in THIS rank's LOCAL token-shard space via
+        lmcache.v1.dcp_utils.plan_dcp_chunk, mirroring vLLM's own
+        _compute_slot_mappings_kernel addressing exactly.
+
+        Not implemented for layerwise retrieval / blending / disaggregated
+        (NIXL) transfer under DCP -- out of scope for the local-disk KV
+        persistence this was built for; fail loudly rather than silently
+        mis-load if one of those combinations is ever exercised.
+        """
+        assert not self.use_layerwise, (
+            "DCP (decode_context_parallel_size>1) + use_layerwise is not "
+            "implemented in the vLLM adapter."
+        )
+        assert request.disagg_spec is None, (
+            "DCP (decode_context_parallel_size>1) + disaggregated (NIXL) "
+            "transfer is not implemented in the vLLM adapter."
+        )
+        assert request.block_ids is not None, (
+            f"DCP request {request.req_id} is missing block_ids in ReqMeta "
+            "(should always be populated by ReqMeta.from_request_tracker "
+            "when dcp_world>1)"
+        )
+        assert self.lmcache_engine is not None
+
+        tokens = request.token_ids
+        load_spec = request.load_spec
+        assert load_spec is not None
+        lmcache_cached_tokens = load_spec.lmcache_cached_tokens
+        vllm_cached_tokens = load_spec.vllm_cached_tokens
+        virtual_block_size = self._block_size * self.dcp_world
+
+        token_mask = torch.ones(len(tokens), dtype=torch.bool)
+        masked_token_count = (
+            vllm_cached_tokens // self._lmcache_chunk_size * self._lmcache_chunk_size
+        )
+        token_mask[:masked_token_count] = False
+
+        hashes: list[int] = []
+        offsets: list[int] = []
+        local_slots: list[int] = []
+        local_vllm_cached_tokens = 0
+
+        for g_start, g_end, chunk_hash in self.lmcache_engine.token_database.process_tokens(
+            tokens[:lmcache_cached_tokens],
+            mask=token_mask[:lmcache_cached_tokens],
+            make_key=False,
+            request_configs=request.request_configs,
+        ):
+            block_id = request.block_ids[g_start // virtual_block_size]
+            plan = plan_dcp_chunk(
+                g_start,
+                g_end,
+                block_id,
+                self._block_size,
+                self.dcp_world,
+                self.dcp_rank,
+                self._cp_kv_cache_interleave,
+                # Passed to EVERY chunk, not just the one straddling the
+                # vllm_cached_tokens boundary: plan_dcp_chunk counts local
+                # positions < vllm_cached_tokens within [g_start, g_end),
+                # which is correctly 0 for every chunk entirely at/after
+                # the boundary and correctly the full local_count for one
+                # entirely before it -- no special-casing needed.
+                vllm_cached_tokens=vllm_cached_tokens,
+            )
+            if plan.local_count == 0:
+                continue
+            hashes.append(chunk_hash)
+            offsets.append(plan.local_count)
+            local_slots.extend(plan.local_slots)
+            local_vllm_cached_tokens += plan.local_vllm_cached_tokens
+
+        if not hashes:
+            return
+
+        # retrieve()'s hashes= path (unlike store()'s) does not convert
+        # kwargs["slot_mapping"] for the caller -- it is forwarded
+        # verbatim to the GPU connector's to_gpu, which indexes it as a
+        # GPU tensor (lmcache/v1/gpu_connector/gpu_connectors.py).
+        local_slot_mapping = torch.tensor(
+            local_slots, dtype=torch.long, device=self.device
+        )
+
+        ret_token_mask = self.lmcache_engine.retrieve(
+            hashes=hashes,
+            offsets=offsets,
+            kvcaches=kvcaches,
+            slot_mapping=local_slot_mapping,
+            vllm_cached_tokens=local_vllm_cached_tokens,
+            request_configs=request.request_configs,
+            req_id=request.req_id,
+        )
+
+        num_retrieved_tokens = ret_token_mask.sum().item()
+        num_expected_tokens = sum(offsets) - local_vllm_cached_tokens
+        if num_retrieved_tokens < num_expected_tokens:
+            logger.error(
+                "Request %s (DCP rank %d/%d): The number of retrieved "
+                "tokens is less than the expected number of tokens! This "
+                "should not happen!",
+                request.req_id,
+                self.dcp_rank,
+                self.dcp_world,
+            )
+            logger.error(
+                "Num retrieved tokens: %d, num expected tokens: %d",
+                num_retrieved_tokens,
+                num_expected_tokens,
+            )
+            missing_blocks = self.record_failed_blocks(
+                request.req_id,
+                torch.ones(sum(offsets), dtype=torch.bool),
+                ret_token_mask,
+                local_slot_mapping,
+            )
+            self._invalid_block_ids.update(missing_blocks)
+
+    def _dcp_store_request(
+        self, request: "ReqMeta", kvcaches: list[torch.Tensor]
+    ) -> None:
+        """DCP-aware equivalent of the tokens/mask store() call in
+        wait_for_save() below, for decode_context_parallel_size>1. See
+        _dcp_retrieve_request above for the LOAD-side counterpart and
+        LMCACHE_FORK_PROGRESS.md for the design.
+
+        Disaggregated (NIXL) transfer, kv_producer role, and
+        use_layerwise are explicitly out of scope (asserted below); DCP +
+        disagg would need its own design (chunk hashes stay global, but
+        transfer_spec/num_transferred_tokens bookkeeping is expressed in
+        whichever token space the disagg backend expects, and this has
+        not been analyzed for DCP).
+        """
+        assert not self.use_layerwise, (
+            "DCP (decode_context_parallel_size>1) + use_layerwise is not "
+            "implemented in the vLLM adapter."
+        )
+        assert request.disagg_spec is None, (
+            "DCP (decode_context_parallel_size>1) + disaggregated (NIXL) "
+            "transfer is not implemented in the vLLM adapter."
+        )
+        assert self.kv_role != "kv_producer", (
+            "DCP (decode_context_parallel_size>1) + kv_producer "
+            "(disaggregated prefill) role is not implemented in the "
+            "vLLM adapter."
+        )
+        assert request.block_ids is not None, (
+            f"DCP request {request.req_id} is missing block_ids in ReqMeta "
+            "(should always be populated by ReqMeta.from_request_tracker "
+            "when dcp_world>1)"
+        )
+        assert self.lmcache_engine is not None
+
+        save_spec = request.save_spec
+        if save_spec is None or not save_spec.can_save:
+            return
+
+        token_ids = request.token_ids
+        virtual_block_size = self._block_size * self.dcp_world
+
+        skip_leading_tokens = save_spec.skip_leading_tokens
+        if skip_leading_tokens == len(token_ids):
+            return  # nothing new to store
+
+        # Align to lmcache chunk size (== virtual_block_size for the
+        # production DCP profile; assert_dcp_chunking_compatible enforces
+        # this relationship at connector-init time).
+        skip_leading_tokens = (
+            skip_leading_tokens // self._lmcache_chunk_size * self._lmcache_chunk_size
+        )
+
+        store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+        store_mask[:skip_leading_tokens] = False
+
+        is_last_prefill = request.is_last_prefill
+        if not is_last_prefill and not self.enable_blending:
+            token_len = len(token_ids)
+            aligned_token_len = (
+                token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
+            )
+            token_ids = token_ids[:aligned_token_len]
+            store_mask = store_mask[:aligned_token_len]
+
+        logger.debug(
+            "Storing KV cache (DCP rank %d/%d) for %d out of %d tokens "
+            "(skip_leading_tokens=%d) for request %s",
+            self.dcp_rank,
+            self.dcp_world,
+            len(token_ids) - skip_leading_tokens,
+            len(token_ids),
+            skip_leading_tokens,
+            request.req_id,
+        )
+
+        hashes: list[int] = []
+        offsets: list[int] = []
+        local_slots: list[int] = []
+
+        for (
+            g_start,
+            g_end,
+            chunk_hash,
+        ) in self.lmcache_engine.token_database.process_tokens(
+            token_ids,
+            mask=store_mask,
+            make_key=False,
+            request_configs=request.request_configs,
+        ):
+            block_id = request.block_ids[g_start // virtual_block_size]
+            plan = plan_dcp_chunk(
+                g_start,
+                g_end,
+                block_id,
+                self._block_size,
+                self.dcp_world,
+                self.dcp_rank,
+                self._cp_kv_cache_interleave,
+            )
+            if plan.local_count == 0:
+                continue
+            hashes.append(chunk_hash)
+            offsets.append(plan.local_count)
+            local_slots.extend(plan.local_slots)
+
+        if hashes:
+            self.lmcache_engine.store(
+                hashes=hashes,
+                offsets=offsets,
+                kvcaches=kvcaches,
+                slot_mapping=local_slots,
+                request_configs=request.request_configs,
+                req_id=request.req_id,
+            )
+
+        # Update skip_leading_tokens only on last rank to ensure each PP
+        # stage stores its own KV cache (mirrors the non-DCP path below).
+        # disagg_spec is asserted None above, so unlike the non-DCP path
+        # there is no request.disagg_spec.num_transferred_tokens to update.
+        if get_pp_group().is_last_rank:
+            save_spec.skip_leading_tokens = len(token_ids)
 
     def record_failed_blocks(
         self,
@@ -1149,6 +1481,10 @@ class LMCacheConnectorV1Impl:
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
+                continue
+
+            if self.dcp_world > 1:
+                self._dcp_store_request(request, kvcaches)
                 continue
 
             token_ids = request.token_ids
@@ -1675,6 +2011,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                dcp_world=self.dcp_world,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -1721,6 +2058,7 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    dcp_world=self.dcp_world,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -1805,8 +2143,10 @@ class LMCacheConnectorV1Impl:
                     len(request_tracker.token_ids),
                     num_current_tokens,
                 )
-                num_token_slots = (
-                    len(request_tracker.allocated_block_ids) * self._block_size
+                # Under DCP, each allocated (virtual) block id spans
+                # block_size*dcp_world GLOBAL tokens, not block_size.
+                num_token_slots = len(request_tracker.allocated_block_ids) * (
+                    self._block_size * self.dcp_world
                 )
                 tokens_to_keep = num_current_tokens
                 if num_token_slots < num_current_tokens:
@@ -1844,6 +2184,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                dcp_world=self.dcp_world,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
