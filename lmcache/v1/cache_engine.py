@@ -779,35 +779,74 @@ class LMCacheEngine:
     @torch.inference_mode()
     def retrieve(
         self,
-        tokens: Union[torch.Tensor, list[int]],
+        tokens: Optional[Union[torch.Tensor, list[int]]] = None,
         mask: Optional[torch.Tensor] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Retrieve the KV caches from the cache engine. And put the retrieved
         KV cache to the serving engine via the GPU connector.
 
-        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+        :param Optional[torch.Tensor] tokens: The tokens of the corresponding
+            KV caches. Mutually exclusive with ``hashes``/``offsets``.
 
         :param Optional[torch.Tensor] mask: The mask for the tokens. Should
             have the same length as tokens. And the mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
+            Only used together with ``tokens``.
+
+        :param Optional[List[int]] hashes: Precomputed chunk hashes to
+            retrieve, in lieu of ``tokens``. Mirrors the ``store(hashes=,
+            offsets=)`` path: lets a caller address chunks by a hash computed
+            from a different (e.g. global, unsharded) token view than the
+            local ``slot_mapping``/tensors passed via ``kwargs`` -- this is
+            what makes DCP (decode-context-parallel) shard-local retrieval
+            possible: the chunk hash stays in global token space (so it
+            matches what was stored) while ``offsets`` and the caller-supplied
+            local ``slot_mapping`` are in this rank's local token-shard space.
+
+        :param Optional[List[int]] offsets: Number of (local) tokens in each
+            chunk named by ``hashes``. Required when ``hashes`` is provided.
 
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
             Should include KV cache specific information (e.g., paged KV buffer
             and the page tables).
 
-        :return: the boolean mask indicating which tokens are retrieved. The
-            length of the mask should be the same as the tokens. On CPU.
+        :return: the boolean mask indicating which tokens are retrieved. When
+            ``tokens`` is used, length == len(tokens). When ``hashes`` is
+            used, length == sum(offsets). On CPU.
 
         :raises: ValueError if the number of Falses in the mask is not a
-            multiple of the chunk size.
+            multiple of the chunk size, or if neither tokens nor hashes is
+            provided.
         """
+        if tokens is None and hashes is None:
+            raise ValueError("Either 'tokens' or 'hashes' must be provided.")
+        if hashes is not None:
+            assert offsets is not None, (
+                "'offsets' must be provided when 'hashes' is provided."
+            )
+            assert mask is None, (
+                "'mask' is not supported together with 'hashes' -- exclude "
+                "already-cached chunks from 'hashes'/'offsets' instead."
+            )
+            assert not self.async_loading, (
+                "The hashes= retrieve path (DCP shard-local addressing) does "
+                "not support async_loading; disable enable_async_loading."
+            )
+            num_required_tokens = sum(offsets)
+        elif mask is not None:
+            num_required_tokens = torch.sum(mask).item()
+        else:
+            num_required_tokens = len(tokens)
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
-            return torch.zeros(len(tokens), dtype=torch.bool)
+            return torch.zeros(num_required_tokens, dtype=torch.bool)
 
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve operation"
@@ -817,11 +856,6 @@ class LMCacheEngine:
         req_id = self._get_req_id(kwargs)
 
         tot_kv_size = 0
-
-        if mask is not None:
-            num_required_tokens = torch.sum(mask).item()
-        else:
-            num_required_tokens = len(tokens)
 
         # KVCache Check logging
         self._log_kvcache_for_check(
@@ -833,12 +867,21 @@ class LMCacheEngine:
 
         retrieve_stats = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
-        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        ret_mask = torch.zeros(num_required_tokens, dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[ProcessedChunk] = []
         if not self._is_passive():
             with retrieve_stats.profile_process_tokens():
-                if self.async_loading:
+                if hashes is not None:
+                    reordered_chunks, tot_kv_size = self._process_tokens_internal(
+                        tokens,
+                        mask,
+                        ret_mask,
+                        hashes=hashes,
+                        offsets=offsets,
+                        **kwargs,
+                    )
+                elif self.async_loading:
                     reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
                         tokens,
                         mask,
@@ -1710,6 +1753,8 @@ class LMCacheEngine:
         tokens,
         mask,
         ret_mask,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
         **kwargs,
     ) -> ProcessTokensInternalResult:
         """Process tokens and populate the reordered lists.
@@ -1717,9 +1762,15 @@ class LMCacheEngine:
         This function is used to process tokens and populate the reordered lists.
 
         Args:
-            tokens: Input tokens to process
-            mask: Mask indicating valid token positions
+            tokens: Input tokens to process (ignored when ``hashes`` is given)
+            mask: Mask indicating valid token positions (ignored when
+                ``hashes`` is given)
             ret_mask: Output mask updated with cache hit positions
+            hashes: Precomputed chunk hashes (DCP shard-local retrieve path;
+                see ``LMCacheEngine.retrieve``). When set, ``offsets`` must
+                also be set and ``start``/``end`` below index into the
+                caller's *local* token/slot_mapping space, not global tokens.
+            offsets: Number of local tokens per chunk in ``hashes``.
             **kwargs: Additional keyword arguments
         """
         assert self.storage_manager is not None
@@ -1733,6 +1784,8 @@ class LMCacheEngine:
         chunk_infos = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
+            hashes=hashes,
+            offsets=offsets,
             mask=mask,
             request_configs=request_configs,
         ):
