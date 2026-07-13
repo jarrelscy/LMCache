@@ -645,7 +645,7 @@ class LMCacheConnectorV1Impl:
                 # scheduler process never needs a rank: it deliberately
                 # never computes a per-rank slot_mapping (see
                 # ReqMeta.from_request_tracker).
-                self.dcp_rank = get_dcp_group().rank_in_group()
+                self.dcp_rank = get_dcp_group().rank_in_group
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0

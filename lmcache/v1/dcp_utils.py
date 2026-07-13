@@ -52,7 +52,7 @@ def dcp_is_local_and_local_offset(
         the token's offset within its *virtual* (shared, dcp_world-times
         oversized) block.
     :param dcp_world: number of DCP ranks (``decode_context_parallel_size``).
-    :param dcp_rank: this worker's DCP rank (``get_dcp_group().rank_in_group()``).
+    :param dcp_rank: this worker's DCP rank (``get_dcp_group().rank_in_group``).
     :param interleave: ``cp_kv_cache_interleave_size`` (vLLM default: 1).
     :returns: ``(is_local, local_offset)``. ``local_offset`` is only
         meaningful when ``is_local`` is True.
