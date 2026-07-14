@@ -323,6 +323,15 @@ class DiskCacheMetadata:
     cached_positions: Optional[torch.Tensor] = None
     fmt: Optional[MemoryFormat] = None
     pin_count: int = 0
+    # Per-kernel-group shapes/dtypes for multi-group MemoryObjs (e.g.
+    # GLM-5.2's DSA-indexer + MLA layer groups). ``shape``/``dtype`` above
+    # remain populated as the first group's shape/dtype for legacy
+    # single-group callers (mirrors MemoryObjMetadata.shape/shapes). When
+    # not None, these are authoritative and must be used for allocation on
+    # the disk-load path -- allocating with only the singular shape/dtype
+    # silently truncates every group after the first.
+    shapes: Optional[list[torch.Size]] = None
+    dtypes: Optional[list[torch.dtype]] = None
 
     def pin(self) -> bool:
         self.pin_count += 1

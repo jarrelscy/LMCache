@@ -54,23 +54,42 @@ _DEFAULT_THREAD_COUNT = 4
 # cache) even though the bytes were still sitting on disk. This sidecar
 # (`<key>.pt.meta`) plus the rebuild/lazy-load logic below fixes that.
 _LOCAL_DISK_METADATA_FILE_SUFFIX = ".meta"
-_LOCAL_DISK_METADATA_VERSION = 1
+# v2: added optional plural "shapes"/"dtypes" for multi-kernel-group
+# MemoryObjs (see _pack_local_disk_metadata). No v1 sidecars have ever
+# been written by a deployed build, so no back-compat reader is needed --
+# an old-version payload is treated as unsupported, same as before.
+_LOCAL_DISK_METADATA_VERSION = 2
 
 
 def _pack_local_disk_metadata(memory_obj: MemoryObj) -> bytes:
-    """Serialize the (shape, dtype, fmt, size) needed to reconstruct a
+    """Serialize the (shape(s), dtype(s), fmt, size) needed to reconstruct a
     ``DiskCacheMetadata`` entry, so a later process can rebuild its index
-    from the files already on disk."""
-    tensor = memory_obj.tensor
-    assert tensor is not None
-    meta = {
+    from the files already on disk.
+
+    Reads straight from ``memory_obj.metadata`` rather than the legacy
+    ``.tensor`` property. ``.tensor`` (memory_management.py) computes the
+    *total* size across all kernel groups via ``get_size()`` but reshapes
+    using only the *first* group's singular ``shape``/``dtype`` -- for any
+    multi-group object (e.g. GLM-5.2's DSA-indexer + MLA layer groups) this
+    raises a view/reshape ``RuntimeError``. ``meta.shapes``/``meta.dtypes``
+    (plural) are the authoritative per-group lists; every allocator in this
+    codebase already populates them alongside the legacy singular
+    ``meta.shape``/``meta.dtype`` (== first group), e.g.
+    ``TensorMemoryAllocator.allocate``.
+    """
+    meta = memory_obj.metadata
+    assert meta.shape is not None and meta.dtype is not None
+    packed: dict[str, Any] = {
         "lmcache_version": _LOCAL_DISK_METADATA_VERSION,
-        "shape": list(tensor.size()),
-        "dtype": TORCH_DTYPE_TO_STR_DTYPE[tensor.dtype],
-        "fmt": memory_obj.metadata.fmt.value,
+        "shape": list(meta.shape),
+        "dtype": TORCH_DTYPE_TO_STR_DTYPE[meta.dtype],
+        "fmt": meta.fmt.value,
         "size": memory_obj.get_physical_size(),
     }
-    return json.dumps(meta).encode("utf-8")
+    if meta.shapes is not None and meta.dtypes is not None:
+        packed["shapes"] = [list(s) for s in meta.shapes]
+        packed["dtypes"] = [TORCH_DTYPE_TO_STR_DTYPE[d] for d in meta.dtypes]
+    return json.dumps(packed).encode("utf-8")
 
 
 def _unpack_local_disk_metadata(buf: bytes):
@@ -81,7 +100,13 @@ def _unpack_local_disk_metadata(buf: bytes):
     dtype = STR_DTYPE_TO_TORCH_DTYPE[meta["dtype"]]
     fmt = MemoryFormat(meta["fmt"])
     size = int(meta["size"])
-    return shape, dtype, fmt, size
+    shapes_raw = meta.get("shapes")
+    dtypes_raw = meta.get("dtypes")
+    shapes = [torch.Size(s) for s in shapes_raw] if shapes_raw else None
+    dtypes = (
+        [STR_DTYPE_TO_TORCH_DTYPE[d] for d in dtypes_raw] if dtypes_raw else None
+    )
+    return shape, dtype, fmt, size, shapes, dtypes
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -341,8 +366,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 try:
                     key = CacheEngineKey.from_string(unmangled_key_str)
                     with open(entry.path, "rb") as f:
-                        shape, dtype, fmt, size = _unpack_local_disk_metadata(
-                            f.read()
+                        shape, dtype, fmt, size, shapes, dtypes = (
+                            _unpack_local_disk_metadata(f.read())
                         )
                 except Exception as e:
                     logger.warning(
@@ -356,7 +381,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 with self.disk_lock:
                     if key not in self.dict:
                         self.dict[key] = DiskCacheMetadata(
-                            data_path, size, shape, dtype, None, fmt, 0
+                            data_path, size, shape, dtype, None, fmt, 0,
+                            shapes=shapes, dtypes=dtypes,
                         )
                         self.current_cache_size += size
                         self.usage += size
@@ -384,7 +410,9 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
         try:
             with open(meta_path, "rb") as f:
-                shape, dtype, fmt, size = _unpack_local_disk_metadata(f.read())
+                shape, dtype, fmt, size, shapes, dtypes = _unpack_local_disk_metadata(
+                    f.read()
+                )
         except Exception as e:
             logger.warning(
                 "LocalDiskBackend: lazy metadata read failed for %s at %s: %s",
@@ -395,7 +423,10 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
         with self.disk_lock:
             if key not in self.dict:
-                self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, None, fmt, 0)
+                self.dict[key] = DiskCacheMetadata(
+                    path, size, shape, dtype, None, fmt, 0,
+                    shapes=shapes, dtypes=dtypes,
+                )
                 self.current_cache_size += size
                 self.usage += size
         return True
@@ -494,6 +525,8 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Optional[torch.Tensor] = None,
+        shapes: Optional[list[torch.Size]] = None,
+        dtypes: Optional[list[torch.dtype]] = None,
     ) -> None:
         path = self._key_to_path(key)
 
@@ -505,7 +538,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 has_stored = True
             else:
                 self.dict[key] = DiskCacheMetadata(
-                    path, size, shape, dtype, cached_positions, fmt, 0
+                    path, size, shape, dtype, cached_positions, fmt, 0,
+                    shapes=shapes, dtypes=dtypes,
                 )
 
         # Push kv admit msg with batching
@@ -530,7 +564,13 @@ class LocalDiskBackend(StorageBackendInterface):
             after the disk write completes. Callback exceptions are caught
             and logged.
         """
-        assert memory_obj.tensor is not None
+        # NOTE: was `assert memory_obj.tensor is not None`. `.tensor` is the
+        # legacy single-kernel-group accessor and raises for multi-group
+        # objects (see `_pack_local_disk_metadata` docstring above).
+        # `raw_tensor` is the shape-agnostic flat view and preserves the
+        # original intent of this sanity check (reject invalidated / no-data
+        # objects, e.g. a placeholder GDSMemoryObject) without the reshape.
+        assert memory_obj.raw_tensor is not None
 
         # skip repeated save
         if self.exists_in_put_tasks(key):
@@ -627,6 +667,8 @@ class LocalDiskBackend(StorageBackendInterface):
             path = disk_meta.path
             dtype = disk_meta.dtype
             shape = disk_meta.shape
+            shapes = disk_meta.shapes
+            dtypes = disk_meta.dtypes
             fmt = disk_meta.fmt
             assert dtype is not None
             assert shape is not None
@@ -636,7 +678,8 @@ class LocalDiskBackend(StorageBackendInterface):
         # must not hold disk_lock while waiting, or concurrent insert/evict
         # operations would deadlock.
         memory_obj = self.load_bytes_from_disk(
-            key, path, dtype=dtype, shape=shape, fmt=fmt
+            key, path, dtype=dtype, shape=shape, fmt=fmt,
+            shapes=shapes, dtypes=dtypes,
         )
 
         if memory_obj is not None:
@@ -674,8 +717,16 @@ class LocalDiskBackend(StorageBackendInterface):
             metas = [self.dict.get(key) for key in keys]
 
         # --- 2. Pre-allocate staging buffers (sequential) -----------------
+        # Prefer the plural per-kernel-group shapes/dtypes when present
+        # (multi-group MemoryObjs, e.g. GLM-5.2's DSA-indexer + MLA groups);
+        # allocating with only the singular shape/dtype would under-size the
+        # buffer and silently truncate every group after the first.
         memory_objs = [
-            self.local_cpu_backend.allocate(m.shape, m.dtype, m.fmt)
+            self.local_cpu_backend.allocate(
+                m.shapes if m.shapes is not None else m.shape,
+                m.dtypes if m.dtypes is not None else m.dtype,
+                m.fmt,
+            )
             if m is not None
             else None
             for m in metas
@@ -753,6 +804,8 @@ class LocalDiskBackend(StorageBackendInterface):
             path = self.dict[key].path
             dtype = self.dict[key].dtype
             shape = self.dict[key].shape
+            shapes = self.dict[key].shapes
+            dtypes = self.dict[key].dtypes
             fmt = self.dict[key].fmt
 
             assert dtype is not None
@@ -761,9 +814,12 @@ class LocalDiskBackend(StorageBackendInterface):
             # busy_loop=False prevents spinning on the event loop thread;
             # if staging memory is exhausted the caller will get a logged
             # error rather than a silent deadlock.
+            # Prefer plural shapes/dtypes (multi-kernel-group MemoryObjs);
+            # see load_bytes_from_disk for why the singular fallback alone
+            # would silently truncate groups after the first.
             memory_obj = self.local_cpu_backend.allocate(
-                shape,
-                dtype,
+                shapes if shapes is not None else shape,
+                dtypes if dtypes is not None else dtype,
                 fmt,
                 busy_loop=False,
             )
@@ -829,8 +885,9 @@ class LocalDiskBackend(StorageBackendInterface):
             write completes for this key. Callback exceptions are caught and
             logged.
         """
-        kv_chunk = memory_obj.tensor
-        assert kv_chunk is not None
+        # See `submit_put_task` above for why this checks `raw_tensor`
+        # (shape-agnostic) rather than the legacy `.tensor` property.
+        assert memory_obj.raw_tensor is not None
         buffer = memory_obj.byte_array
         path = self._key_to_path(key)
 
@@ -864,11 +921,17 @@ class LocalDiskBackend(StorageBackendInterface):
         size = memory_obj.get_physical_size()
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
         memory_obj.ref_count_down()
 
-        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
+        self.insert_key(
+            key, size, shape, dtype, fmt,
+            cached_positions=cached_positions,
+            shapes=shapes, dtypes=dtypes,
+        )
 
         self.disk_worker.remove_put_task(key)
 
@@ -914,12 +977,24 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         shape: torch.Size,
         fmt: MemoryFormat,
+        shapes: Optional[list[torch.Size]] = None,
+        dtypes: Optional[list[torch.dtype]] = None,
     ) -> Optional[MemoryObj]:
         """
         Load bytearray from disk.
-        """
 
-        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+        ``shapes``/``dtypes`` (plural), when not ``None``, are the
+        authoritative per-kernel-group shapes for a multi-group MemoryObj
+        (e.g. GLM-5.2's DSA-indexer + MLA layer groups) and take precedence
+        over the singular ``shape``/``dtype``. Allocating with only the
+        singular shape would silently under-size the buffer -- the
+        subsequent `read_file`/`readinto` would then only partially fill it
+        from the on-disk bytes, truncating every group after the first
+        without raising.
+        """
+        alloc_shapes = shapes if shapes is not None else shape
+        alloc_dtypes = dtypes if dtypes is not None else dtype
+        memory_obj = self.local_cpu_backend.allocate(alloc_shapes, alloc_dtypes, fmt)
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
