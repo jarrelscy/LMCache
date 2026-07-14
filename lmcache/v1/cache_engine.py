@@ -1005,7 +1005,15 @@ class LMCacheEngine:
                 req_id,
                 retrieved_tokens,
                 num_required_tokens,
-                len(tokens),
+                # `tokens` is None on the hashes= retrieve path (DCP
+                # shard-local addressing, see _dcp_retrieve_request in
+                # vllm_v1_adapter.py) -- that path never passes tokens=,
+                # only hashes=/offsets=. len(tokens) unconditionally
+                # crashed the engine with TypeError on every real
+                # DCP cache-hit retrieve. Fall back to num_required_tokens
+                # (already correct for this call in every branch above)
+                # when there's no token list to measure.
+                len(tokens) if tokens is not None else num_required_tokens,
                 tot_kv_size / 1024**3,
                 onload_time * 1000,
                 tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
