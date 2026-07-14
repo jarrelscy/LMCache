@@ -838,6 +838,35 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._manager.post_init()
 
+        # Eagerly force the GPU connector's one-time layout discovery here
+        # (which, as a side effect, constructs
+        # LMCacheMetadata.kv_layer_groups_manager) instead of leaving it to
+        # the first lazy to_gpu()/from_gpu() call.
+        #
+        # Without this, on a freshly-booted engine the very first
+        # LMCacheEngine.store() computes metadata.get_shapes()/get_dtypes()
+        # (to size the MemoryObj) while kv_layer_groups_manager is still
+        # None, so it falls back to a single legacy group. The SAME store()
+        # call then invokes gpu_connector.batched_from_gpu() -> from_gpu(),
+        # which is what actually triggers
+        # VLLMPagedMemGPUConnectorV3._initialize_kv_cache_pointers() for the
+        # first time -- discovering the model's real multi-group layout
+        # (e.g. MLA + DSA indexer + MTP draft groups for GLM-5.2/DeepSeek-V4
+        # style models) and building one GPU pointer tensor per REAL group.
+        # from_gpu then iterates those pointer tensors and calls
+        # memory_obj.get_tensor(i) for each -- but memory_obj was allocated
+        # moments earlier from the stale legacy single-group shape, so its
+        # group_prefix_sum is too short and get_tensor() raises
+        # "IndexError: list index out of range" for any group index beyond
+        # the first. Running layout discovery here, while kv_caches is
+        # freshly known and before any store()/load() can race ahead of it,
+        # keeps get_shapes()/get_dtypes() correct from the very first call.
+        gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        eager_init_fn = getattr(gpu_connector, "_initialize_kv_cache_pointers", None)
+        if gpu_connector is not None and eager_init_fn is not None:
+            gpu_connector.initialize_kvcaches_ptr(kvcaches=list(kv_caches.values()))
+            eager_init_fn()
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
