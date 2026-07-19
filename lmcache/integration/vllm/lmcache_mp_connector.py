@@ -135,7 +135,42 @@ def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     return False
 
 
-def validate_mamba_step_alignment(vllm_config: VllmConfig) -> None:
+def _kv_cache_config_has_mamba_groups(kv_cache_config: Any) -> bool:
+    """Return whether any KV cache group actually holds Mamba state caches.
+
+    ``cache_config.mamba_cache_mode`` alone is not evidence of Mamba layers:
+    vLLM's ``MambaModelConfig`` hook stamps ``align`` on any architecture it
+    tags as mamba-like, including models whose recurrent state is managed as
+    a plain paged ``SlidingWindowSpec`` cache (e.g. Inkling's short-conv
+    streams), which have per-token slots and need no end-of-step snapshot
+    alignment. Only true ``MambaSpec`` groups have snapshot semantics.
+
+    When ``kv_cache_config`` is ``None`` (older vLLM, no config plumbed) we
+    conservatively return True so the alignment check still applies.
+    """
+    if kv_cache_config is None:
+        return True
+    try:
+        # Third Party
+        from vllm.v1.kv_cache_interface import (
+            KVCacheSpecKind,
+            get_kv_cache_spec_kind,
+        )
+    except ImportError:
+        return True
+    for group in getattr(kv_cache_config, "kv_cache_groups", ()) or ():
+        spec = group.kv_cache_spec
+        inner = getattr(spec, "kv_cache_specs", None)
+        leaf_specs = list(inner.values()) if isinstance(inner, dict) else [spec]
+        for leaf in leaf_specs:
+            if get_kv_cache_spec_kind(leaf) == KVCacheSpecKind.MAMBA:
+                return True
+    return False
+
+
+def validate_mamba_step_alignment(
+    vllm_config: VllmConfig, kv_cache_config: Any = None
+) -> None:
     """Reject scheduler configs that can skip Mamba state snapshots.
 
     In ``mamba_cache_mode="align"`` vLLM snapshots the recurrent state only at
@@ -152,12 +187,18 @@ def validate_mamba_step_alignment(vllm_config: VllmConfig) -> None:
     Args:
         vllm_config: The vLLM config; only Mamba-hybrid models in ``align``
             cache mode are constrained, others pass.
+        kv_cache_config: vLLM ``KVCacheConfig`` when available; used to skip
+            the constraint for models stamped ``align`` without any actual
+            ``MambaSpec`` group (their caches are per-token paged specs with
+            no snapshot semantics).
 
     Raises:
         ValueError: If ``max_num_batched_tokens`` is not in
             ``[block_size, 2 * block_size)``.
     """
     if getattr(vllm_config.cache_config, "mamba_cache_mode", "none") != "align":
+        return
+    if not _kv_cache_config_has_mamba_groups(kv_cache_config):
         return
     block_size = vllm_config.cache_config.block_size
     max_batched = vllm_config.scheduler_config.max_num_batched_tokens
@@ -576,7 +617,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         # Fail fast, before the server handshake below.
-        validate_mamba_step_alignment(vllm_config)
+        validate_mamba_step_alignment(
+            vllm_config, getattr(self, "_kv_cache_config", None)
+        )
         validate_kv_cache_groups(getattr(self, "_kv_cache_config", None))
 
         assert vllm_config.kv_transfer_config is not None
