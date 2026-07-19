@@ -262,6 +262,32 @@ class MemoryLayoutDesc:
 
 
 @dataclass(frozen=True)
+class PerObjectGroupLayoutDesc(MemoryLayoutDesc):
+    """Memory layouts for a model whose object groups have different sizes.
+
+    Hybrid models with object-group separation store one memory object PER
+    object group per chunk, and the groups' objects have different shapes
+    (e.g. Inkling: full-attention vs sliding-window attention vs short-conv
+    state groups). ``per_group[g]`` is object group ``g``'s layout, in
+    object-group order.
+
+    The base fields (``shapes`` / ``dtypes``) carry object group 0's layout
+    so consumers that treat the descriptor as a single-object layout keep
+    their previous behavior; allocation paths that are object-group-aware
+    (the prefetch controller's L1 write reservation) must use ``per_group``
+    keyed by ``ObjectKey.object_group_id``.
+    """
+
+    per_group: tuple[MemoryLayoutDesc, ...] = ()
+
+    def layout_for_group(self, object_group_id: int) -> MemoryLayoutDesc:
+        """Return the layout of *object_group_id* (base layout when unset)."""
+        if 0 <= object_group_id < len(self.per_group):
+            return self.per_group[object_group_id]
+        return self
+
+
+@dataclass(frozen=True)
 class AttnWindowDesc:
     """Per-object-group cross-chunk attention windows, in LMCache chunks.
 

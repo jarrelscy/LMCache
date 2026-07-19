@@ -27,6 +27,7 @@ from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
     AttnWindowDesc,
     MemoryLayoutDesc,
+    PerObjectGroupLayoutDesc,
     ObjectKey,
     PrefetchMode,
     TrimPolicy,
@@ -899,12 +900,32 @@ class PrefetchController(StorageControllerInterface):
             retentions = self._policy.select_l1_retentions(
                 keys_to_reserve,
             )
-        write_results = l1_mgr.reserve_write(
-            keys=keys_to_reserve,
-            is_temporary=[not r for r in retentions],
-            layout_desc=request.layout_desc,
-            mode="new",
-        )
+        is_temporary = [not r for r in retentions]
+        if isinstance(request.layout_desc, PerObjectGroupLayoutDesc):
+            # Hybrid models with object-group separation: each object group's
+            # memory objects have their own layout, so reserve per group —
+            # a single-layout reservation would allocate group-0-sized
+            # buffers for every group and corrupt the L2 loads.
+            write_results = {}
+            by_group: dict[int, list[int]] = {}
+            for i, key in enumerate(keys_to_reserve):
+                by_group.setdefault(key.object_group_id, []).append(i)
+            for gid, idxs in by_group.items():
+                write_results.update(
+                    l1_mgr.reserve_write(
+                        keys=[keys_to_reserve[i] for i in idxs],
+                        is_temporary=[is_temporary[i] for i in idxs],
+                        layout_desc=request.layout_desc.layout_for_group(gid),
+                        mode="new",
+                    )
+                )
+        else:
+            write_results = l1_mgr.reserve_write(
+                keys=keys_to_reserve,
+                is_temporary=is_temporary,
+                layout_desc=request.layout_desc,
+                mode="new",
+            )
 
         # Step 4: filter to successfully reserved keys
         reserved_key_set: set[ObjectKey] = set()
@@ -981,11 +1002,7 @@ class PrefetchController(StorageControllerInterface):
             request.pending_load_tasks[adapter_idx] = task_id
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
             # events.  Uniform layout per chunk -> size * count.
-            total_bytes = (
-                per_adapter_objs[0].get_size() * len(per_adapter_objs)
-                if per_adapter_objs
-                else 0
-            )
+            total_bytes = sum(o.get_size() for o in per_adapter_objs)
             request.load_bytes_by_adapter[adapter_idx] = total_bytes
 
             self._event_bus.publish(

@@ -21,6 +21,7 @@ from lmcache.utils import (
 )
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
+    PerObjectGroupLayoutDesc,
     ObjectKey,
 )
 from lmcache.v1.gpu_connector.gpu_ops import (
@@ -863,10 +864,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             separate_object_groups=self._ctx.separate_object_groups,
             full_sw_kv=self._ctx.full_sw_kv,
         )
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
         kv_groups_manager = cache_context.kv_layer_groups_manager
+        # One layout per OBJECT GROUP: hybrid models with object-group
+        # separation store one differently-sized memory object per group per
+        # chunk. Registering only group 0's layout (the old behavior) made
+        # the prefetch controller allocate group-0-sized L1 buffers for EVERY
+        # group's L2 loads, corrupting any disk restore of a multi-group
+        # model (group-1 bytes truncated into group-0-sized objects).
+        per_group_descs = tuple(
+            get_layout_desc(cache_context, self._ctx.chunk_size, object_group_id=g)
+            for g in range(kv_groups_manager.num_object_groups)
+        )
+        layout_desc = PerObjectGroupLayoutDesc(
+            shapes=list(per_group_descs[0].shapes),
+            dtypes=list(per_group_descs[0].dtypes),
+            per_group=per_group_descs,
+        )
         attn_desc = kv_groups_manager.get_attn_desc()
         self._ctx.layout_desc_registry.register(
             model_name, world_size, layout_desc, attn_desc
