@@ -53,7 +53,5 @@ def test_per_layer_formats_mixed_rank4():
     normalized, formats = U.normalize_and_discover_per_layer_formats(
         caches, groups, EngineType.VLLM, HINTS
     )
-    assert all(
-        f == lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS for f in formats
-    )
+    assert all(f == lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS for f in formats)
     assert tuple(normalized[2].shape) == (NB, 4, BS, 2, 512)

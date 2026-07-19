@@ -501,8 +501,7 @@ def test_blocks_fused_native_matches_fallback_object_layout():
 
     torch.manual_seed(7)
     src_gpu = [
-        torch.rand([nb, nh, bs, 2, hs], dtype=dtype, device=device)
-        for _ in range(nl)
+        torch.rand([nb, nh, bs, 2, hs], dtype=dtype, device=device) for _ in range(nl)
     ]
     src_cpu = [t.cpu() for t in src_gpu]
 
@@ -526,8 +525,7 @@ def test_blocks_fused_native_matches_fallback_object_layout():
         for _ in range(num_objects)
     ]
     lmc_ops.multi_layer_block_kv_transfer(
-        torch.tensor([t.data_ptr() for t in src_gpu], dtype=torch.int64,
-                     device=device),
+        torch.tensor([t.data_ptr() for t in src_gpu], dtype=torch.int64, device=device),
         [o.data_ptr() for o in native_objs],
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         device,
