@@ -35,12 +35,17 @@ class VLLM_Detector(EngineDetector):
             and isinstance(kv_caches[0], torch.Tensor)
             and kv_caches[0].dim() == 4
         ):
-            fused_dim = kv_caches[0].shape[3]
-            if fused_dim % 2 != 0:
-                raise ValueError(
-                    f"blocks-first fused trailing dim {fused_dim} is not 2 * head_size"
-                )
-            split = [t.reshape(*t.shape[:3], 2, fused_dim // 2) for t in kv_caches]
+            # Split each tensor by ITS OWN trailing dim: hybrid models (e.g.
+            # Inkling) register rank-4 layers with different fused widths
+            # (attention 2*head_size next to packed conv-state slabs), and
+            # using layer 0's width for every tensor breaks the reshape.
+            for t in kv_caches:
+                if t.shape[3] % 2 != 0:
+                    raise ValueError(
+                        f"blocks-first fused trailing dim {t.shape[3]} is not "
+                        "2 * head_size"
+                    )
+            split = [t.reshape(*t.shape[:3], 2, t.shape[3] // 2) for t in kv_caches]
             return lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS, split
 
         list_depth, tensor_ndim, first_tensor = measure_list_depth_until_tensor(

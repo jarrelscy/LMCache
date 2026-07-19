@@ -51,6 +51,7 @@ FMT_SGLANG_MHA = lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS
 FMT_SGLANG_MLA = lmc_ops.EngineKVFormat.NL_X_NBBS_ONE_HS
 FMT_NORMAL_HND = lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS
 FMT_FLASH_INFER_HND = lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
+FMT_BLOCKS_FUSED = lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS
 
 # Format parameters: (engine_kv_format, num_layers, num_heads, head_size, is_mla)
 # Use small layer counts to keep GPU memory usage low in CI
@@ -63,6 +64,24 @@ FORMAT_PARAMS = [
     (FMT_SGLANG_MLA, 4, 1, 576, True),
     (FMT_NORMAL_HND, 4, 8, 128, False),
     (FMT_FLASH_INFER_HND, 4, 8, 128, False),
+    # Blocks-first fused K/V (vLLM rank-4 [NB, NH, BS, 2*HS] backends, e.g.
+    # the Inkling SM120 fork's FlashAttention + sconv conv-state caches).
+    # Two geometries: attention-like (many heads, small HS) and
+    # conv-state-like (few heads, wide packed HS).
+    (FMT_BLOCKS_FUSED, 4, 4, 128, False),
+    (FMT_BLOCKS_FUSED, 4, 2, 512, False),
+]
+FORMAT_IDS = [
+    "normal",
+    "cross_layer",
+    "flash_infer",
+    "mla",
+    "sglang_mha",
+    "sglang_mla",
+    "normal_hnd",
+    "flash_infer_hnd",
+    "blocks_fused_attn",
+    "blocks_fused_wide",
 ]
 
 
@@ -101,6 +120,10 @@ def create_vllm_tensors(
     elif engine_kv_format == FMT_SGLANG_MLA:
         shape = [nbbs, 1, hs]
         return [_create_random_tensor(shape, dtype, device) for _ in range(nl)]
+    elif engine_kv_format == FMT_BLOCKS_FUSED:
+        # Canonical split view of the registered rank-4 [NB, NH, BS, 2*HS].
+        shape = [nb, nh, bs, 2, hs]
+        return [_create_random_tensor(shape, dtype, device) for _ in range(nl)]
     raise ValueError(f"Unknown format: {engine_kv_format}")
 
 
@@ -138,6 +161,9 @@ def create_zero_vllm_tensors(
         return [_create_zero_tensor(shape, dtype, device) for _ in range(2 * nl)]
     elif engine_kv_format == FMT_SGLANG_MLA:
         shape = [nbbs, 1, hs]
+        return [_create_zero_tensor(shape, dtype, device) for _ in range(nl)]
+    elif engine_kv_format == FMT_BLOCKS_FUSED:
+        shape = [nb, nh, bs, 2, hs]
         return [_create_zero_tensor(shape, dtype, device) for _ in range(nl)]
     raise ValueError(f"Unknown format: {engine_kv_format}")
 
@@ -196,6 +222,8 @@ def get_block_data(
         elif engine_kv_format == FMT_SGLANG_MLA:
             ts, ed = block_idx * bs, (block_idx + 1) * bs
             results.append(vllm_tensors[layer_idx][ts:ed, 0, :].clone())
+        elif engine_kv_format == FMT_BLOCKS_FUSED:
+            results.append(vllm_tensors[layer_idx][block_idx, :, :, :, :].clone())
     return results
 
 
@@ -263,16 +291,7 @@ TOTAL_BLOCKS = NUM_MEMORY_OBJECTS * BLOCKS_PER_OBJECT  # 64
 @pytest.mark.parametrize(
     "engine_kv_format,nl,nh,hs,is_mla",
     FORMAT_PARAMS,
-    ids=[
-        "normal",
-        "cross_layer",
-        "flash_infer",
-        "mla",
-        "sglang_mha",
-        "sglang_mla",
-        "normal_hnd",
-        "flash_infer_hnd",
-    ],
+    ids=FORMAT_IDS,
 )
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
@@ -366,16 +385,7 @@ def test_block_transfer_roundtrip(
 @pytest.mark.parametrize(
     "engine_kv_format,nl,nh,hs,is_mla",
     FORMAT_PARAMS,
-    ids=[
-        "normal",
-        "cross_layer",
-        "flash_infer",
-        "mla",
-        "sglang_mha",
-        "sglang_mla",
-        "normal_hnd",
-        "flash_infer_hnd",
-    ],
+    ids=FORMAT_IDS,
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype):
@@ -469,3 +479,85 @@ def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype)
             assert block.abs().sum().item() == 0, (
                 f"Skipped block {i}, layer {layer_idx} is not zero"
             )
+
+
+def test_blocks_fused_native_matches_fallback_object_layout():
+    """Native format-10 kernel must produce the exact memory-object bytes the
+    python fallback produces (the fallback is the layout's reference impl and
+    what CPU-only stacks read/write)."""
+    # First Party
+    from lmcache.python_ops_fallback import (
+        multi_layer_block_kv_transfer as fallback_transfer,
+    )
+    from lmcache.python_ops_fallback import set_shape_desc_dtype
+
+    nl, nb, bs, nh, hs = 3, 32, 4, 4, 512  # Inkling sconv-like geometry
+    tokens_per_object = 16
+    blocks_per_object = tokens_per_object // bs
+    num_objects = 2
+    total_blocks = num_objects * blocks_per_object
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+
+    torch.manual_seed(7)
+    src_gpu = [
+        torch.rand([nb, nh, bs, 2, hs], dtype=dtype, device=device)
+        for _ in range(nl)
+    ]
+    src_cpu = [t.cpu() for t in src_gpu]
+
+    block_ids = random.Random(9).sample(range(nb), total_blocks)
+
+    def _shape_desc():
+        sd = lmc_ops.PageBufferShapeDesc()
+        sd.kv_size = 2
+        sd.nl = nl
+        sd.nb = nb
+        sd.bs = bs
+        sd.nh = nh
+        sd.hs = hs
+        sd.element_size = 2
+        set_shape_desc_dtype(sd, dtype)
+        return sd
+
+    # Native D2H on GPU (pinned-CPU memory objects, as in production).
+    native_objs = [
+        torch.zeros([2, nl, tokens_per_object, nh * hs], dtype=dtype).pin_memory()
+        for _ in range(num_objects)
+    ]
+    lmc_ops.multi_layer_block_kv_transfer(
+        torch.tensor([t.data_ptr() for t in src_gpu], dtype=torch.int64,
+                     device=device),
+        [o.data_ptr() for o in native_objs],
+        torch.tensor(block_ids, dtype=torch.int64, device=device),
+        device,
+        lmc_ops.TransferDirection.D2H,
+        _shape_desc(),
+        tokens_per_object,
+        FMT_BLOCKS_FUSED,
+        0,
+    )
+    torch.cuda.synchronize()
+
+    # Fallback D2H on the CPU copies. One object at a time: the fallback maps
+    # block_ids across all objects in one call the same way.
+    fallback_objs = [
+        torch.zeros([2, nl, tokens_per_object, nh * hs], dtype=dtype)
+        for _ in range(num_objects)
+    ]
+    fallback_transfer(
+        torch.tensor([t.data_ptr() for t in src_cpu], dtype=torch.int64),
+        [o.data_ptr() for o in fallback_objs],
+        torch.tensor(block_ids, dtype=torch.long),
+        torch.device("cpu"),
+        lmc_ops.TransferDirection.D2H,
+        _shape_desc(),
+        tokens_per_object,
+        FMT_BLOCKS_FUSED,
+        0,
+    )
+
+    for i in range(num_objects):
+        assert torch.equal(native_objs[i], fallback_objs[i]), (
+            f"object {i}: native kernel layout diverges from fallback"
+        )
