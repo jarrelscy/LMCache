@@ -975,7 +975,21 @@ class LMCacheEngine:
                 if self._is_sync_pd_backend():
                     memory_obj.ref_count_down()
             else:
-                if memory_obj.is_pinned:
+                # Chunks pinned by lookup(pin=True) are tracked in
+                # self.lookup_pins and released by lookup_unpin() in
+                # wait_for_save(). Unpinning them here too (added upstream in
+                # #3884 / 495cc9a8) double-unpins the same object
+                # (pin_count -> -1) and, under save_only_first_rank + L1
+                # eviction pressure, drops the chunk to pin=0/ref=1 (can_evict
+                # == True) while a leader retrieve still holds it, so store()'s
+                # eviction frees it mid-broadcast -> leader/passive NCCL
+                # collective desync -> "No available shared memory broadcast
+                # block" hang. Only release pins that retrieve itself owns
+                # (req_id absent from lookup_pins), preserving #3884's leak fix
+                # for non-lookup callers. ref_count_down stays unconditional to
+                # balance get_blocking's ref_count_up (batched_unpin never
+                # ref_count_downs).
+                if req_id not in self.lookup_pins and memory_obj.is_pinned:
                     memory_obj.unpin()
                 memory_obj.ref_count_down()
 
