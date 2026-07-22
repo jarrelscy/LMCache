@@ -171,6 +171,12 @@ class InFlightPrefetchRequest:
     # Load phase: keys that were write-reserved in L1
     write_reserved_keys: list[ObjectKey] = field(default_factory=list)
     write_reserved_objs: dict[ObjectKey, MemoryObj] = field(default_factory=dict)
+    # Load phase: sliding-window keys intentionally not reserved/loaded because
+    # they fall outside the object group's window (no GPU home — vLLM null-pads
+    # them). Kept so the prefix-hit count and read-lock finalize logic can fold
+    # them back in (they must count as a hit but must never be loaded or
+    # lock-released, since no lock was ever taken for them).
+    sw_absent_keys: set[ObjectKey] = field(default_factory=set)
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -901,6 +907,13 @@ class PrefetchController(StorageControllerInterface):
                 keys_to_reserve,
             )
         is_temporary = [not r for r in retentions]
+        # Keys that a sliding-window object group does not need in L1/GPU: the
+        # out-of-window leading chunks. They have no GPU home (vLLM null-pads
+        # out-of-window SWA blocks), so we neither reserve nor load them — this
+        # is what bounds the restore working set at long context. They are still
+        # counted as a prefix hit below (folded into ``hit_bitmap``) so the
+        # reported hit is not truncated at the first skipped chunk.
+        sw_absent_keys: set[ObjectKey] = request.sw_absent_keys
         if isinstance(request.layout_desc, PerObjectGroupLayoutDesc):
             # Hybrid models with object-group separation: each object group's
             # memory objects have their own layout, so reserve per group —
@@ -911,10 +924,28 @@ class PrefetchController(StorageControllerInterface):
             for i, key in enumerate(keys_to_reserve):
                 by_group.setdefault(key.object_group_id, []).append(i)
             for gid, idxs in by_group.items():
+                # For a sliding-window group, keep only the trailing ``w`` chunks
+                # (keys are chunk-major / rank-minor, so ``w * ranks`` trailing
+                # keys). Mirrors the H2D transfer's ``num_objects_to_skip`` and
+                # uses the same per-group window as ``get_attn_desc``.
+                keep_idxs = idxs
+                if (
+                    gid < request.attn_desc.num_object_groups
+                    and not request.attn_desc.is_full_attention(gid)
+                ):
+                    w = request.attn_desc.num_chunks_in_sw[gid]
+                    ranks = len({keys_to_reserve[i].kv_rank for i in idxs})
+                    n_keep = w * max(ranks, 1)
+                    n_absent = max(0, len(idxs) - n_keep)
+                    for i in idxs[:n_absent]:
+                        sw_absent_keys.add(keys_to_reserve[i])
+                    keep_idxs = idxs[n_absent:]
+                if not keep_idxs:
+                    continue
                 write_results.update(
                     l1_mgr.reserve_write(
-                        keys=[keys_to_reserve[i] for i in idxs],
-                        is_temporary=[is_temporary[i] for i in idxs],
+                        keys=[keys_to_reserve[i] for i in keep_idxs],
+                        is_temporary=[is_temporary[i] for i in keep_idxs],
                         layout_desc=request.layout_desc.layout_for_group(gid),
                         mode="new",
                     )
@@ -959,14 +990,35 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
-        # Step 5: recompute load plan excluding failed reservations
+        # Step 5: recompute load plan excluding failed reservations.
+        #
+        # Two bitmaps are built and deliberately DECOUPLED:
+        #   reserved_bitmap  — keys we actually reserved an L1 buffer for and
+        #                      will load. Drives the load plan.
+        #   hit_bitmap       — reserved keys PLUS the out-of-window sliding-window
+        #                      keys we intentionally skipped (``sw_absent_keys``).
+        #                      Drives the reported prefix-hit count.
+        #
+        # Keys are chunk-major / rank-minor, so an out-of-window SWA chunk sits at
+        # a LEADING position. If it were left out of the hit bitmap, the PREFIX
+        # trim would stop at chunk 0 and the hit would collapse to zero. Folding
+        # sw_absent into hit_bitmap lets the prefix run to the true boundary while
+        # still excluding those keys from the load (they have no GPU home — vLLM
+        # null-pads out-of-window SWA blocks, so not loading them is lossless).
         reserved_bitmap = Bitmap(num_keys)
+        hit_bitmap = Bitmap(num_keys)
         for i, key in enumerate(request.keys):
             if key in reserved_key_set:
                 reserved_bitmap.set(i)
+                hit_bitmap.set(i)
+            elif key in sw_absent_keys:
+                hit_bitmap.set(i)
 
-        retained = build_trim_mask(reserved_bitmap, num_keys, request.policy)
-        trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
+        # retained = whole prefix that counts as a hit (reported to vLLM).
+        retained = build_trim_mask(hit_bitmap, num_keys, request.policy)
+        # load only keys that were actually reserved, within the hit prefix.
+        load_mask = retained.__and__(reserved_bitmap)
+        trimmed_plan = trim_load_plan_with_mask(load_plan, load_mask)
         request.load_plan = trimmed_plan
 
         ## Step 6: phase 1 unlock — keys locked in lookup but not in plan
@@ -1204,7 +1256,22 @@ class PrefetchController(StorageControllerInterface):
 
         # Release read locks for any loaded key outside the retained set
         # (partial load failures can create gaps).
-        retained = build_trim_mask(result_bitmap, num_keys, request.policy)
+        #
+        # Out-of-window sliding-window keys were intentionally never loaded, so
+        # they are absent from result_bitmap. Fold them into the hit bitmap that
+        # drives the reported prefix count so the prefix is not truncated at the
+        # first skipped chunk — mirroring _transition_to_load_phase. They must
+        # NOT be gathered into ``released`` (no lock was ever taken for them):
+        # ``released`` is derived from result_bitmap, which excludes them.
+        if request.sw_absent_keys:
+            loaded_positions = set(result_bitmap.get_indices_list())
+            hit_bitmap = Bitmap(num_keys)
+            for i, key in enumerate(request.keys):
+                if i in loaded_positions or key in request.sw_absent_keys:
+                    hit_bitmap.set(i)
+            retained = build_trim_mask(hit_bitmap, num_keys, request.policy)
+        else:
+            retained = build_trim_mask(result_bitmap, num_keys, request.policy)
         released_bitmap = result_bitmap & (~retained)
         released = released_bitmap.gather(request.keys)
         if released:

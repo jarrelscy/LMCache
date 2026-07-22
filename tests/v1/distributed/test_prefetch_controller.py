@@ -20,8 +20,10 @@ import torch
 # First Party
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
+    PerObjectGroupLayoutDesc,
     PrefetchMode,
     TrimPolicy,
 )
@@ -1496,5 +1498,193 @@ class TestPrefetchMode:
         for key in keys:
             assert read_results[key][0] == L1Error.KEY_NOT_EXIST
 
+        ctrl.stop()
+        adapter.close()
+
+
+# =============================================================================
+# Sliding-window whole-chunk skip (hybrid models: Inkling)
+# =============================================================================
+
+
+def make_group_key(chunk_id: int, group_id: int, kv_rank: int = 0) -> ObjectKey:
+    """Object key for a specific (chunk, object group, kv_rank)."""
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
+        model_name="test_model",
+        kv_rank=kv_rank,
+        object_group_id=group_id,
+    )
+
+
+def chunk_major_keys(
+    num_chunks: int, num_groups: int, num_ranks: int = 1
+) -> list[ObjectKey]:
+    """Build keys in the wire order the lookup path emits: chunk-major, then
+    object group, then kv_rank (see ``_chunk_major_object_keys``)."""
+    keys: list[ObjectKey] = []
+    for chunk in range(num_chunks):
+        for group in range(num_groups):
+            for rank in range(num_ranks):
+                keys.append(make_group_key(chunk, group, rank))
+    return keys
+
+
+class TestSlidingWindowWholeChunkSkip:
+    """A sliding-window object group must reserve/load only its trailing
+    window chunks, while still reporting the full prefix as a hit.
+
+    This is the fix that bounds the LMCache restore working set at long
+    context for Inkling (55 sliding-window layers would otherwise stage every
+    chunk of every layer through the pinned host pool)."""
+
+    def test_swa_group_skips_leading_chunks_but_full_prefix_hit(self, l1_manager):
+        """Group 0 = full attention (keep all 5 chunks); group 1 = sliding
+        window of 2 chunks (keep only the trailing 2). All 10 keys are in L2,
+        so the reported prefix hit must be the whole 10 — NOT collapsed to the
+        first skipped chunk — yet the 3 leading group-1 chunks must never enter
+        L1."""
+        adapter = make_adapter()
+        layout = make_layout()
+        num_chunks = 5
+        keys = chunk_major_keys(num_chunks, num_groups=2, num_ranks=1)
+        store_keys_in_l2(adapter, keys, layout)
+
+        per_group_layout = PerObjectGroupLayoutDesc(
+            shapes=layout.shapes,
+            dtypes=layout.dtypes,
+            per_group=(layout, layout),
+        )
+        # group 0 full attention (-1), group 1 sliding window of 2 chunks.
+        attn_desc = AttnWindowDesc(num_chunks_in_sw=[-1, 2])
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(
+            keys, per_group_layout, attn_desc=attn_desc
+        )
+        result = wait_for_prefetch_result(ctrl, req_id)
+
+        # Full prefix hit: 5 chunks * 2 groups = 10 keys. A naive skip would
+        # collapse this to 1 (first group-1 chunk skipped at a leading index).
+        assert result == 10, f"Expected full 10-key prefix hit, got {result}"
+
+        loaded = [k for k in keys if k.object_group_id == 0] + [
+            make_group_key(c, 1) for c in (3, 4)
+        ]
+        skipped = [make_group_key(c, 1) for c in (0, 1, 2)]
+
+        # Loaded keys are read-locked in L1.
+        read_results = l1_manager.unsafe_read(loaded)
+        for key in loaded:
+            assert read_results[key][0] == L1Error.SUCCESS, (
+                f"expected {key} loaded into L1"
+            )
+
+        # Out-of-window group-1 chunks were never staged into L1.
+        miss = l1_manager.reserve_read(skipped)
+        for key in skipped:
+            assert miss[key][0] == L1Error.KEY_NOT_EXIST, (
+                f"out-of-window key {key} must not be in L1"
+            )
+
+        l1_manager.finish_read(loaded)
+        ctrl.stop()
+        adapter.close()
+
+    def test_swa_rank_minor_window_is_ranks_times_chunks(self, l1_manager):
+        """With multiple kv_ranks per chunk, the retained window is
+        ``window_chunks * num_ranks`` trailing keys (keys are rank-minor)."""
+        adapter = make_adapter()
+        layout = make_layout()
+        num_chunks = 4
+        num_ranks = 2
+        keys = chunk_major_keys(num_chunks, num_groups=2, num_ranks=num_ranks)
+        store_keys_in_l2(adapter, keys, layout)
+
+        per_group_layout = PerObjectGroupLayoutDesc(
+            shapes=layout.shapes,
+            dtypes=layout.dtypes,
+            per_group=(layout, layout),
+        )
+        attn_desc = AttnWindowDesc(num_chunks_in_sw=[-1, 2])
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(
+            keys, per_group_layout, attn_desc=attn_desc
+        )
+        result = wait_for_prefetch_result(ctrl, req_id)
+        # 4 chunks * 2 groups * 2 ranks = 16 keys, full prefix.
+        assert result == 16, f"Expected full 16-key prefix hit, got {result}"
+
+        # group 1 keeps trailing 2 chunks for BOTH ranks; chunks 0,1 skipped.
+        loaded = [
+            make_group_key(c, g, r)
+            for c in range(num_chunks)
+            for g in (0,)
+            for r in range(num_ranks)
+        ] + [make_group_key(c, 1, r) for c in (2, 3) for r in range(num_ranks)]
+        skipped = [make_group_key(c, 1, r) for c in (0, 1) for r in range(num_ranks)]
+
+        read_results = l1_manager.unsafe_read(loaded)
+        for key in loaded:
+            assert read_results[key][0] == L1Error.SUCCESS
+
+        miss = l1_manager.reserve_read(skipped)
+        for key in skipped:
+            assert miss[key][0] == L1Error.KEY_NOT_EXIST
+
+        l1_manager.finish_read(loaded)
+        ctrl.stop()
+        adapter.close()
+
+    def test_full_attention_per_group_layout_loads_everything(self, l1_manager):
+        """A homogeneous full-attention model on the per-object-group path
+        (GLM / MiniMax-M3) must be unaffected: nothing is skipped."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = chunk_major_keys(num_chunks=5, num_groups=2, num_ranks=1)
+        store_keys_in_l2(adapter, keys, layout)
+
+        per_group_layout = PerObjectGroupLayoutDesc(
+            shapes=layout.shapes,
+            dtypes=layout.dtypes,
+            per_group=(layout, layout),
+        )
+        # Both groups full attention → no skipping.
+        attn_desc = AttnWindowDesc(num_chunks_in_sw=[-1, -1])
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(
+            keys, per_group_layout, attn_desc=attn_desc
+        )
+        result = wait_for_prefetch_result(ctrl, req_id)
+        assert result == 10
+
+        read_results = l1_manager.unsafe_read(keys)
+        for key in keys:
+            assert read_results[key][0] == L1Error.SUCCESS
+
+        l1_manager.finish_read(keys)
         ctrl.stop()
         adapter.close()
