@@ -529,6 +529,39 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.init = True
         logger.info("init kv cache pointers success in VLLMPagedMemGPUConnectorV3")
 
+    def _group_kernel_params(self, group_idx: int):
+        """Per-group kernel geometry for ``multi_layer_kv_transfer``.
+
+        This V3 non-MP path historically forwarded a single scalar
+        ``engine_kv_format`` / ``block_size`` / ``head_size`` /
+        ``page_buffer_size`` (sampled from group 0 -- see
+        ``_initialize_kv_cache_pointers``) to *every* group. That is correct
+        only when all groups share one layout (GLM-5.2: homogeneous MLA). It
+        silently corrupts -- and on MLA groups, illegally addresses -- transfers
+        for models whose groups differ, because the kernel derives its entire
+        page-buffer stride *and* ``k_or_v_size = is_mla(fmt) ? 1 : 2`` from
+        ``engine_kv_format``. MiniMax-M3 is the first such heterogeneous case: a
+        standard K/V group (``kv_size=2``, ``block_stride_elems=0``) PLUS a
+        key-only lightning-indexer MLA group (``kv_size=1``,
+        ``block_stride_elems=16384``). Passing group 0's standard format to the
+        MLA group reads it as a 2-KV standard layout -> out-of-bounds ->
+        ``CUDA error: an illegal memory access``.
+
+        Mirror the MP path (``blend_v3``) and dispatch each group with its own
+        ``shape_desc``-derived geometry. Groups here are enumerated in the same
+        order as ``group_kv_cache_pointers_on_gpu`` (both iterate
+        ``kv_layer_groups``), so ``group_idx`` lines up.
+        """
+        assert self.metadata.kv_layer_groups_manager is not None
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        sd = group.shape_desc
+        fmt = group.engine_kv_format
+        if fmt is None:
+            # Detection-built groups always set a format; None only for bench
+            # bookkeeping groups that never transfer. Fall back to the scalar.
+            fmt = self.engine_kv_format
+        return fmt, sd.bs, sd.hs, sd.nb * sd.bs
+
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         assert memory_obj.raw_tensor is not None
@@ -552,6 +585,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
+            g_fmt, g_bs, g_hs, g_pbs = self._group_kernel_params(i)
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
             lmc_ops.multi_layer_kv_transfer(
@@ -559,11 +593,11 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 kv_cache_pointer,
                 slot_mapping[start:end],
                 self.device,
-                self.page_buffer_size,
+                g_pbs,
                 lmc_ops.TransferDirection.H2D,
-                self.engine_kv_format,
-                block_size=self.block_size,
-                head_size=self.head_size,
+                g_fmt,
+                block_size=g_bs,
+                head_size=g_hs,
                 skip_prefix_n_tokens=skip_prefix_n_tokens,
             )
 
@@ -583,6 +617,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 for i, kv_cache_pointer in enumerate(
                     self.group_kv_cache_pointers_on_gpu
                 ):
+                    g_fmt, g_bs, g_hs, g_pbs = self._group_kernel_params(i)
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
                     lmc_ops.multi_layer_kv_transfer(
@@ -590,11 +625,11 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                         kv_cache_pointer,
                         slot_mapping[start:end],
                         self.device,
-                        self.page_buffer_size,
+                        g_pbs,
                         lmc_ops.TransferDirection.D2H,
-                        self.engine_kv_format,
-                        block_size=self.block_size,
-                        head_size=self.head_size,
+                        g_fmt,
+                        block_size=g_bs,
+                        head_size=g_hs,
                     )
             else:
                 # kvcaches -> gpu_buffer -> memobj
@@ -602,17 +637,18 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 for i, kv_cache_pointer in enumerate(
                     self.group_kv_cache_pointers_on_gpu
                 ):
+                    g_fmt, g_bs, g_hs, g_pbs = self._group_kernel_params(i)
                     tmp_gpu_buffer = self.group_tmp_buffer[i][:, :, : end - start, :]
                     lmc_ops.multi_layer_kv_transfer(
                         tmp_gpu_buffer,
                         kv_cache_pointer,
                         slot_mapping[start:end],
                         self.device,
-                        self.page_buffer_size,
+                        g_pbs,
                         lmc_ops.TransferDirection.D2H,
-                        self.engine_kv_format,
-                        block_size=self.block_size,
-                        head_size=self.head_size,
+                        g_fmt,
+                        block_size=g_bs,
+                        head_size=g_hs,
                     )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
